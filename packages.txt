@@ -1,0 +1,5 @@
+# System packages for Streamlit Cloud
+# These are needed for Pillow and ReportLab
+libjpeg-dev
+zlib1g-dev
+libfreetype6-dev
