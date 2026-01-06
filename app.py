@@ -136,25 +136,54 @@ class GitBookAPI:
             raise Exception("Could not get PDF URL. PDF export may require a Premium or Ultimate GitBook plan.")
         return url
     
+    def get_space_published_url(self, space_id: str) -> str:
+        """Get the published URL for a space (if public)"""
+        space = self.get_space(space_id)
+        urls = space.get('urls', {})
+        return urls.get('published') or urls.get('public') or ''
+    
     def download_pdf(self, space_id: str) -> bytes:
         """Download the GitBook-generated PDF"""
         pdf_url = self.get_pdf_url(space_id)
         
-        # Download with streaming to handle large files
-        response = requests.get(pdf_url, timeout=300, stream=True)
+        # The PDF URL from GitBook API is a print URL that needs to be accessed
+        # It may require authentication or redirect
+        
+        # Try downloading with auth headers first
+        response = requests.get(
+            pdf_url, 
+            headers=self.headers,  # Include auth
+            timeout=300, 
+            stream=True,
+            allow_redirects=True
+        )
         response.raise_for_status()
         
         # Check content type
         content_type = response.headers.get('content-type', '')
-        if 'html' in content_type.lower():
-            raise Exception("Received HTML instead of PDF. The PDF export URL may have expired or be invalid.")
-        
-        # Read content
         content = response.content
+        
+        # If we got HTML, it might be a print page that needs browser rendering
+        if 'html' in content_type.lower() or content.startswith(b'<!') or content.startswith(b'<html'):
+            # Return info about what we received for debugging
+            preview = content[:500].decode('utf-8', errors='ignore')
+            raise Exception(
+                f"GitBook returned an HTML page instead of PDF.\n\n"
+                f"This usually means:\n"
+                f"1. PDF export requires a Premium or Ultimate GitBook plan\n"
+                f"2. The space visibility settings prevent PDF export\n"
+                f"3. The PDF URL is a print-preview page (not direct PDF)\n\n"
+                f"URL returned: {pdf_url[:100]}...\n\n"
+                f"Response preview: {preview[:200]}..."
+            )
         
         # Verify it's a PDF
         if not content.startswith(b'%PDF'):
-            raise Exception("Downloaded content is not a valid PDF file.")
+            raise Exception(
+                f"Downloaded content is not a valid PDF.\n"
+                f"Content-Type: {content_type}\n"
+                f"First bytes: {content[:50]}"
+            )
         
         return content
 
@@ -692,9 +721,43 @@ def main():
                 pages_data = api.get_all_pages(space_id)
                 pages = pages_data.get('pages', [])
                 
+                st.write("Getting PDF URL from GitBook...")
+                try:
+                    pdf_url = api.get_pdf_url(space_id)
+                    st.write(f"PDF URL obtained (valid for ~1 hour)")
+                except Exception as e:
+                    status.update(label="❌ Could not get PDF URL", state="error")
+                    st.error(str(e))
+                    st.stop()
+                
                 st.write("Downloading GitBook PDF (this may take a moment)...")
-                gitbook_pdf = api.download_pdf(space_id)
-                st.write(f"Downloaded: {len(gitbook_pdf) / 1024:.1f} KB")
+                try:
+                    gitbook_pdf = api.download_pdf(space_id)
+                    st.write(f"Downloaded: {len(gitbook_pdf) / 1024:.1f} KB")
+                except Exception as e:
+                    status.update(label="⚠️ PDF Download Issue", state="error")
+                    st.error(str(e))
+                    
+                    # Show manual option
+                    st.warning(
+                        "**Manual workaround:**\n\n"
+                        f"1. Open this URL in your browser (you may need to be logged into GitBook):\n\n"
+                        f"`{pdf_url}`\n\n"
+                        "2. Use your browser's Print → Save as PDF function\n"
+                        "3. Upload the PDF below to add cover page and enhancements"
+                    )
+                    
+                    uploaded_pdf = st.file_uploader(
+                        "Upload GitBook PDF manually",
+                        type=['pdf'],
+                        key="manual_pdf"
+                    )
+                    
+                    if uploaded_pdf:
+                        gitbook_pdf = uploaded_pdf.getvalue()
+                        st.success(f"✅ Uploaded PDF: {len(gitbook_pdf)/1024:.1f} KB")
+                    else:
+                        st.stop()
                 
                 if original_btn:
                     # Just return original
