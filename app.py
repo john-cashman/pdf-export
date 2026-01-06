@@ -379,95 +379,6 @@ class PDFEnhancer:
         buffer.seek(0)
         return buffer.getvalue()
     
-    def _create_toc_pages(self, pages: List[dict]) -> bytes:
-        """Create table of contents"""
-        buffer = io.BytesIO()
-        c = canvas.Canvas(buffer, pagesize=self.page_size)
-        
-        width, height = self.page_size
-        margin = 60
-        
-        # Build TOC entries (groups, pages, subpages)
-        toc_entries = []
-        
-        def process_pages(page_list: List[dict], depth: int = 0):
-            for page in page_list:
-                if page.get('type') == 'link':
-                    continue
-                
-                # Include up to 3 levels (group, page, subpage)
-                if depth <= 2:
-                    toc_entries.append({
-                        'title': page.get('title', 'Untitled'),
-                        'level': depth
-                    })
-                
-                if page.get('pages'):
-                    process_pages(page['pages'], depth + 1)
-        
-        process_pages(pages)
-        
-        # Calculate pages needed
-        entries_per_page = 40
-        num_toc_pages = max(1, (len(toc_entries) + entries_per_page - 1) // entries_per_page)
-        
-        # Assign page numbers (cover=1, toc pages, then content)
-        front_matter = 1 + num_toc_pages
-        for i, entry in enumerate(toc_entries):
-            entry['page'] = front_matter + i + 1  # Simplified: each entry = 1 page
-        
-        # Draw TOC
-        current_entry = 0
-        for toc_page_num in range(num_toc_pages):
-            y = height - margin
-            
-            if toc_page_num == 0:
-                c.setFont("Helvetica-Bold", 24)
-                c.setFillColor(self.primary_color)
-                c.drawString(margin, y, "Table of Contents")
-                y -= 45
-            
-            entries_drawn = 0
-            while current_entry < len(toc_entries) and entries_drawn < entries_per_page:
-                entry = toc_entries[current_entry]
-                level = entry['level']
-                title = entry['title']
-                
-                indent = level * 18
-                
-                # Style by level
-                if level == 0:
-                    c.setFont("Helvetica-Bold", 11)
-                    c.setFillColor(self.primary_color)
-                elif level == 1:
-                    c.setFont("Helvetica", 10)
-                    c.setFillColor(HexColor('#333333'))
-                else:
-                    c.setFont("Helvetica", 9)
-                    c.setFillColor(HexColor('#666666'))
-                
-                # Truncate if needed
-                max_w = width - 2*margin - indent - 40
-                display_title = title
-                while stringWidth(display_title, c._fontname, c._fontsize) > max_w and len(display_title) > 10:
-                    display_title = display_title[:-4] + "..."
-                
-                c.drawString(margin + indent, y, display_title)
-                
-                y -= 16 if level == 0 else 14
-                current_entry += 1
-                entries_drawn += 1
-                
-                if y < margin + 40:
-                    break
-            
-            if current_entry < len(toc_entries):
-                c.showPage()
-        
-        c.save()
-        buffer.seek(0)
-        return buffer.getvalue()
-    
     def _add_headers_footers(self, input_pdf: bytes, start_page: int = 1) -> bytes:
         """Add headers and footers to PDF pages"""
         reader = PdfReader(io.BytesIO(input_pdf))
@@ -554,13 +465,52 @@ class PDFEnhancer:
         return output.getvalue()
     
     def enhance_pdf(self, gitbook_pdf: bytes, space_info: dict, pages: List[dict], org_info: dict = None) -> bytes:
-        """Enhance the GitBook PDF"""
+        """Enhance the GitBook PDF with linked TOC, cover, headers/footers"""
+        from pypdf.generic import (
+            ArrayObject, DictionaryObject, FloatObject, 
+            NameObject, NumberObject, TextStringObject,
+            IndirectObject
+        )
         
         # Verify input is valid PDF
         if not gitbook_pdf.startswith(b'%PDF'):
             raise Exception("Input is not a valid PDF file")
         
         original_reader = PdfReader(io.BytesIO(gitbook_pdf))
+        content_page_count = len(original_reader.pages)
+        
+        # Calculate structure
+        cover_pages = 1 if self.config.include_cover else 0
+        
+        # Count TOC entries to determine TOC page count
+        toc_entries = []
+        def count_entries(page_list, depth=0):
+            for page in page_list:
+                if page.get('type') == 'link':
+                    continue
+                if depth <= 2:
+                    toc_entries.append({'title': page.get('title', 'Untitled'), 'level': depth})
+                if page.get('pages'):
+                    count_entries(page['pages'], depth + 1)
+        
+        if self.config.include_toc and pages:
+            count_entries(pages)
+        
+        entries_per_page = 40
+        toc_page_count = max(1, (len(toc_entries) + entries_per_page - 1) // entries_per_page) if toc_entries else 0
+        
+        content_start_index = cover_pages + toc_page_count
+        
+        # Calculate target pages for each TOC entry
+        for i, entry in enumerate(toc_entries):
+            if content_page_count > 0 and len(toc_entries) > 0:
+                # Distribute entries proportionally across content pages
+                page_index = content_start_index + int((i / len(toc_entries)) * content_page_count)
+            else:
+                page_index = content_start_index + i
+            entry['target_page_index'] = min(page_index, content_start_index + content_page_count - 1)
+            entry['display_page_num'] = entry['target_page_index'] + 1
+        
         writer = PdfWriter()
         
         # 1. Add cover page
@@ -570,24 +520,20 @@ class PDFEnhancer:
             for page in cover_reader.pages:
                 writer.add_page(page)
         
-        # 2. Add TOC
-        toc_pages_count = 0
-        if self.config.include_toc and pages:
-            toc_pdf = self._create_toc_pages(pages)
+        # 2. Create TOC pages (without links for now - we'll add them after)
+        toc_page_indices = []
+        if self.config.include_toc and toc_entries:
+            toc_pdf = self._create_toc_visual(toc_entries)
             toc_reader = PdfReader(io.BytesIO(toc_pdf))
-            toc_pages_count = len(toc_reader.pages)
             for page in toc_reader.pages:
+                toc_page_indices.append(len(writer.pages))
                 writer.add_page(page)
         
-        # Calculate content start page
-        content_start = 1
-        if self.config.include_cover:
-            content_start += 1
-        content_start += toc_pages_count
+        # 3. Add headers/footers to content and append
+        content_start_page_num = content_start_index + 1
         
-        # 3. Add headers/footers to content
         if self.config.include_header or self.config.include_footer or self.config.show_page_numbers:
-            enhanced_content = self._add_headers_footers(gitbook_pdf, start_page=content_start)
+            enhanced_content = self._add_headers_footers(gitbook_pdf, start_page=content_start_page_num)
             enhanced_reader = PdfReader(io.BytesIO(enhanced_content))
             for page in enhanced_reader.pages:
                 writer.add_page(page)
@@ -595,7 +541,11 @@ class PDFEnhancer:
             for page in original_reader.pages:
                 writer.add_page(page)
         
-        # 4. Metadata
+        # 4. Add clickable links to TOC pages
+        if toc_entries and toc_page_indices:
+            self._add_toc_links(writer, toc_entries, toc_page_indices, content_start_index)
+        
+        # 5. Add PDF metadata
         writer.add_metadata({
             '/Title': self.config.cover_title or space_info.get('title', 'Documentation'),
             '/Author': self.config.organization_name or (org_info.get('title') if org_info else 'GitBook'),
@@ -606,6 +556,169 @@ class PDFEnhancer:
         writer.write(output)
         output.seek(0)
         return output.getvalue()
+    
+    def _create_toc_visual(self, toc_entries: List[dict]) -> bytes:
+        """Create the visual TOC pages (links added separately)"""
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=self.page_size)
+        
+        width, height = self.page_size
+        margin = 60
+        entries_per_page = 40
+        
+        current_entry = 0
+        page_num = 0
+        
+        while current_entry < len(toc_entries):
+            y = height - margin
+            
+            if page_num == 0:
+                c.setFont("Helvetica-Bold", 24)
+                c.setFillColor(self.primary_color)
+                c.drawString(margin, y, "Table of Contents")
+                y -= 45
+            
+            entries_on_page = 0
+            while current_entry < len(toc_entries) and entries_on_page < entries_per_page:
+                entry = toc_entries[current_entry]
+                level = entry['level']
+                title = entry['title']
+                display_num = entry.get('display_page_num', current_entry + 1)
+                
+                indent = level * 18
+                
+                # Style by level
+                if level == 0:
+                    font_name = "Helvetica-Bold"
+                    font_size = 11
+                    c.setFont(font_name, font_size)
+                    c.setFillColor(self.primary_color)
+                    line_height = 18
+                elif level == 1:
+                    font_name = "Helvetica"
+                    font_size = 10
+                    c.setFont(font_name, font_size)
+                    c.setFillColor(HexColor('#333333'))
+                    line_height = 15
+                else:
+                    font_name = "Helvetica"
+                    font_size = 9
+                    c.setFont(font_name, font_size)
+                    c.setFillColor(HexColor('#666666'))
+                    line_height = 14
+                
+                # Store position for link creation
+                entry['y_position'] = y
+                entry['page_in_toc'] = page_num
+                
+                # Truncate title if needed
+                max_w = width - 2*margin - indent - 50
+                display_title = title
+                while stringWidth(display_title, font_name, font_size) > max_w and len(display_title) > 10:
+                    display_title = display_title[:-4] + "..."
+                
+                title_width = stringWidth(display_title, font_name, font_size)
+                entry['title_width'] = title_width
+                entry['indent'] = indent
+                entry['line_height'] = line_height
+                
+                # Draw title
+                c.drawString(margin + indent, y, display_title)
+                
+                # Draw page number
+                c.setFont("Helvetica", 9)
+                c.setFillColor(HexColor('#888888'))
+                page_str = str(display_num)
+                page_num_width = stringWidth(page_str, "Helvetica", 9)
+                c.drawRightString(width - margin, y, page_str)
+                
+                # Draw dot leaders
+                dots_start = margin + indent + title_width + 8
+                dots_end = width - margin - page_num_width - 8
+                if dots_end > dots_start:
+                    c.setFillColor(HexColor('#cccccc'))
+                    x = dots_start
+                    while x < dots_end:
+                        c.circle(x, y + 3, 0.5, fill=True, stroke=False)
+                        x += 4
+                
+                y -= line_height
+                current_entry += 1
+                entries_on_page += 1
+                
+                if y < margin + 40:
+                    break
+            
+            # Page number at bottom
+            c.setFont("Helvetica", 9)
+            c.setFillColor(HexColor('#888888'))
+            c.drawCentredString(width / 2, 30, str(page_num + 2))
+            
+            if current_entry < len(toc_entries):
+                c.showPage()
+                page_num += 1
+        
+        c.save()
+        buffer.seek(0)
+        return buffer.getvalue()
+    
+    def _add_toc_links(self, writer: PdfWriter, toc_entries: List[dict], 
+                       toc_page_indices: List[int], content_start_index: int):
+        """Add clickable links to TOC entries using pypdf"""
+        from pypdf.generic import (
+            ArrayObject, DictionaryObject, FloatObject,
+            NameObject, NumberObject
+        )
+        
+        width, height = self.page_size
+        margin = 60
+        
+        for entry in toc_entries:
+            toc_page_num = entry.get('page_in_toc', 0)
+            if toc_page_num >= len(toc_page_indices):
+                continue
+            
+            pdf_page_index = toc_page_indices[toc_page_num]
+            target_page_index = entry.get('target_page_index', content_start_index)
+            
+            y = entry.get('y_position', height - 100)
+            indent = entry.get('indent', 0)
+            line_height = entry.get('line_height', 16)
+            
+            # Create link annotation
+            link_rect = ArrayObject([
+                FloatObject(margin + indent),
+                FloatObject(y - 3),
+                FloatObject(width - margin),
+                FloatObject(y + line_height - 3)
+            ])
+            
+            # Create the link annotation dictionary
+            link_annotation = DictionaryObject()
+            link_annotation[NameObject("/Type")] = NameObject("/Annot")
+            link_annotation[NameObject("/Subtype")] = NameObject("/Link")
+            link_annotation[NameObject("/Rect")] = link_rect
+            link_annotation[NameObject("/Border")] = ArrayObject([
+                NumberObject(0), NumberObject(0), NumberObject(0)
+            ])
+            
+            # Create destination to target page (fit page in window)
+            target_page = writer.pages[target_page_index]
+            dest = ArrayObject([
+                target_page.indirect_reference,
+                NameObject("/XYZ"),
+                FloatObject(0),
+                FloatObject(height),
+                FloatObject(0)
+            ])
+            link_annotation[NameObject("/Dest")] = dest
+            
+            # Add annotation to the TOC page
+            page = writer.pages[pdf_page_index]
+            if "/Annots" in page:
+                page["/Annots"].append(link_annotation)
+            else:
+                page[NameObject("/Annots")] = ArrayObject([link_annotation])
 
 
 def main():
