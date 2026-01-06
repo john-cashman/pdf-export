@@ -1,20 +1,7 @@
 # GitBook PDF Export Tool - Dependencies
-# Core Streamlit
-streamlit>=1.28.0
-
-# API requests
-requests>=2.31.0
-
-# PDF Generation
-reportlab>=4.0.0
-pypdf>=3.17.0
-
-# Markdown processing
-markdown>=3.5.0
-beautifulsoup4>=4.12.0
-
-# Image handling
-Pillow>=10.0.0
-
-# Data handling (optional, for table exports)
-pandas>=2.0.0
+streamlit
+requests
+reportlab
+markdown
+beautifulsoup4
+Pillow
