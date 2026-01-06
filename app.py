@@ -22,6 +22,8 @@ from PIL import Image as PILImage
 import tempfile
 import os
 import time
+import subprocess
+import sys
 
 # Page configuration
 st.set_page_config(
@@ -50,6 +52,43 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+
+def install_playwright():
+    """Install playwright browsers if not already installed"""
+    try:
+        from playwright.sync_api import sync_playwright
+        # Test if browsers are installed by trying to launch
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        return True
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'executable doesn' in error_msg or 'browser' in error_msg:
+            try:
+                st.info("🔧 Installing browser for PDF rendering (one-time setup)...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    check=True, 
+                    capture_output=True,
+                    text=True
+                )
+                st.success("✅ Browser installed successfully!")
+                return True
+            except subprocess.CalledProcessError as install_error:
+                st.error(f"Failed to install browser: {install_error.stderr}")
+                return False
+        else:
+            st.error(f"Playwright error: {e}")
+            return False
+
+
+# Check playwright on app start
+@st.cache_resource
+def ensure_playwright():
+    """Ensure playwright is set up (cached to run once)"""
+    return install_playwright()
 
 
 @dataclass
@@ -136,56 +175,62 @@ class GitBookAPI:
             raise Exception("Could not get PDF URL. PDF export may require a Premium or Ultimate GitBook plan.")
         return url
     
-    def get_space_published_url(self, space_id: str) -> str:
-        """Get the published URL for a space (if public)"""
-        space = self.get_space(space_id)
-        urls = space.get('urls', {})
-        return urls.get('published') or urls.get('public') or ''
-    
-    def download_pdf(self, space_id: str) -> bytes:
-        """Download the GitBook-generated PDF"""
+    def download_pdf_via_browser(self, space_id: str, status_callback=None) -> bytes:
+        """Download PDF by rendering the print page with a headless browser"""
+        from playwright.sync_api import sync_playwright
+        
         pdf_url = self.get_pdf_url(space_id)
         
-        # The PDF URL from GitBook API is a print URL that needs to be accessed
-        # It may require authentication or redirect
+        if status_callback:
+            status_callback("Launching browser to render PDF...")
         
-        # Try downloading with auth headers first
-        response = requests.get(
-            pdf_url, 
-            headers=self.headers,  # Include auth
-            timeout=300, 
-            stream=True,
-            allow_redirects=True
-        )
-        response.raise_for_status()
-        
-        # Check content type
-        content_type = response.headers.get('content-type', '')
-        content = response.content
-        
-        # If we got HTML, it might be a print page that needs browser rendering
-        if 'html' in content_type.lower() or content.startswith(b'<!') or content.startswith(b'<html'):
-            # Return info about what we received for debugging
-            preview = content[:500].decode('utf-8', errors='ignore')
-            raise Exception(
-                f"GitBook returned an HTML page instead of PDF.\n\n"
-                f"This usually means:\n"
-                f"1. PDF export requires a Premium or Ultimate GitBook plan\n"
-                f"2. The space visibility settings prevent PDF export\n"
-                f"3. The PDF URL is a print-preview page (not direct PDF)\n\n"
-                f"URL returned: {pdf_url[:100]}...\n\n"
-                f"Response preview: {preview[:200]}..."
+        with sync_playwright() as p:
+            # Launch headless browser
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            page = context.new_page()
+            
+            if status_callback:
+                status_callback("Loading GitBook print page...")
+            
+            # Navigate to the PDF URL
+            page.goto(pdf_url, wait_until='networkidle', timeout=120000)
+            
+            if status_callback:
+                status_callback("Waiting for content to render...")
+            
+            # Wait for the content to fully load
+            # GitBook print pages have specific elements we can wait for
+            try:
+                page.wait_for_selector('main', timeout=30000)
+            except:
+                pass
+            
+            # Additional wait for any lazy-loaded content
+            page.wait_for_timeout(3000)
+            
+            if status_callback:
+                status_callback("Generating PDF...")
+            
+            # Generate PDF
+            pdf_bytes = page.pdf(
+                format='A4',
+                print_background=True,
+                margin={
+                    'top': '0.5in',
+                    'bottom': '0.5in',
+                    'left': '0.5in',
+                    'right': '0.5in'
+                }
             )
-        
-        # Verify it's a PDF
-        if not content.startswith(b'%PDF'):
-            raise Exception(
-                f"Downloaded content is not a valid PDF.\n"
-                f"Content-Type: {content_type}\n"
-                f"First bytes: {content[:50]}"
-            )
-        
-        return content
+            
+            browser.close()
+            
+            return pdf_bytes
+    
+    def download_pdf(self, space_id: str, status_callback=None) -> bytes:
+        """Download the GitBook-generated PDF (tries browser rendering)"""
+        return self.download_pdf_via_browser(space_id, status_callback)
 
 
 class PDFEnhancer:
@@ -566,6 +611,9 @@ class PDFEnhancer:
 def main():
     """Main application"""
     
+    # Ensure playwright is set up
+    playwright_ready = ensure_playwright()
+    
     st.markdown('<h1 class="main-header">📚 GitBook PDF Export Tool</h1>', unsafe_allow_html=True)
     st.caption("Enhance your GitBook PDF exports with cover pages, table of contents, and branding.")
     
@@ -702,69 +750,46 @@ def main():
     
     # Handle export
     if export_btn or original_btn:
+        if not playwright_ready:
+            st.error("Browser rendering is not available. Please check the logs.")
+            st.stop()
+        
         try:
             api = GitBookAPI(api_token)
             
             with st.status("Generating PDF...", expanded=True) as status:
                 st.write("Fetching space information...")
                 space_info = api.get_space(space_id)
+                st.write(f"✓ Space: {space_info.get('title')}")
                 
                 org_info = None
                 if org_id:
                     try:
                         st.write("Fetching organization...")
                         org_info = api.get_organization(org_id)
+                        st.write(f"✓ Organization: {org_info.get('title')}")
                     except:
                         pass
                 
                 st.write("Fetching page structure...")
                 pages_data = api.get_all_pages(space_id)
                 pages = pages_data.get('pages', [])
+                st.write(f"✓ Found {len(pages)} top-level pages")
                 
-                st.write("Getting PDF URL from GitBook...")
-                try:
-                    pdf_url = api.get_pdf_url(space_id)
-                    st.write(f"PDF URL obtained (valid for ~1 hour)")
-                except Exception as e:
-                    status.update(label="❌ Could not get PDF URL", state="error")
-                    st.error(str(e))
-                    st.stop()
+                # Create a placeholder for browser status updates
+                browser_status = st.empty()
                 
-                st.write("Downloading GitBook PDF (this may take a moment)...")
-                try:
-                    gitbook_pdf = api.download_pdf(space_id)
-                    st.write(f"Downloaded: {len(gitbook_pdf) / 1024:.1f} KB")
-                except Exception as e:
-                    status.update(label="⚠️ PDF Download Issue", state="error")
-                    st.error(str(e))
-                    
-                    # Show manual option
-                    st.warning(
-                        "**Manual workaround:**\n\n"
-                        f"1. Open this URL in your browser (you may need to be logged into GitBook):\n\n"
-                        f"`{pdf_url}`\n\n"
-                        "2. Use your browser's Print → Save as PDF function\n"
-                        "3. Upload the PDF below to add cover page and enhancements"
-                    )
-                    
-                    uploaded_pdf = st.file_uploader(
-                        "Upload GitBook PDF manually",
-                        type=['pdf'],
-                        key="manual_pdf"
-                    )
-                    
-                    if uploaded_pdf:
-                        gitbook_pdf = uploaded_pdf.getvalue()
-                        st.success(f"✅ Uploaded PDF: {len(gitbook_pdf)/1024:.1f} KB")
-                    else:
-                        st.stop()
+                def update_status(msg):
+                    browser_status.write(msg)
+                
+                st.write("Rendering PDF via browser (this may take 30-60 seconds)...")
+                gitbook_pdf = api.download_pdf(space_id, status_callback=update_status)
+                st.write(f"✓ PDF rendered: {len(gitbook_pdf) / 1024:.1f} KB")
                 
                 if original_btn:
-                    # Just return original
                     final_pdf = gitbook_pdf
                     filename = f"{space_info.get('title', 'doc').replace(' ', '_')}_original.pdf"
                 else:
-                    # Enhance
                     st.write("Adding cover, TOC, and headers/footers...")
                     enhancer = PDFEnhancer(config)
                     final_pdf = enhancer.enhance_pdf(gitbook_pdf, space_info, pages, org_info)
