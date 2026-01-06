@@ -2,6 +2,5 @@
 streamlit
 requests
 reportlab
-markdown
-beautifulsoup4
+pypdf
 Pillow
